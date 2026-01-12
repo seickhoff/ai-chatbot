@@ -13,6 +13,8 @@ class VoiceAssistant {
   private chatGPT: ChatGPTService;
   private textToSpeech: SayTTSService;
   private audioOutput: AudioOutputService;
+  private calibratedThreshold: number = 0.5;
+  private calibratedSilenceDuration: number = 1.5;
 
   constructor() {
     const openaiKey = process.env.OPENAI_API_KEY;
@@ -32,32 +34,38 @@ class VoiceAssistant {
 
   async listenForWakeWord(): Promise<boolean> {
     try {
-      console.log('\n👂 Listening for wake word "hey you"...\n');
+      console.log('\n👂 Listening continuously for wake word "Isis"...\n');
 
-      // Record for up to 5 seconds or until 1 second of silence
-      const audioStream = this.audioInput.startRecording(0.5, 1.0);
-      const transcriptionPromise = this.speechToText.recognizeStream(audioStream);
+      // Keep listening in a loop until we hear the wake word
+      while (true) {
+        // Record with volume-based silence detection
+        // Stop after 1.5 seconds of silence below 400 (after user finishes speaking)
+        const audioStream = this.audioInput.startRecording(0, 1.5, 400);
+        const transcriptionPromise = this.speechToText.recognizeStream(audioStream);
 
-      // Wait up to 5 seconds, then force stop if needed
-      const timeout = new Promise<void>((resolve) => {
-        setTimeout(() => {
-          this.audioInput.stopRecording();
-          resolve();
-        }, 5000);
-      });
+        // Fallback timeout after 30 seconds in case silence detection doesn't work
+        const timeout = new Promise<void>((resolve) => {
+          setTimeout(() => {
+            console.log('⏱️  30 second timeout reached, stopping recording...');
+            this.audioInput.stopRecording();
+            resolve();
+          }, 30000);
+        });
 
-      await Promise.race([transcriptionPromise, timeout]);
-      const userText = await transcriptionPromise;
+        await Promise.race([transcriptionPromise, timeout]);
+        const userText = await transcriptionPromise;
 
-      console.log(`📋 Heard: "${userText}"`);
+        console.log(`📋 Heard: "${userText}"`);
 
-      // Check if wake word was detected
-      const normalizedText = userText.toLowerCase().trim();
-      if (normalizedText.includes('hey you') || normalizedText.includes('hey yu')) {
-        return true;
+        // Check if wake word was detected
+        const normalizedText = userText.toLowerCase().trim();
+        if (normalizedText.includes('isis') || normalizedText.includes('ice is')) {
+          return true;
+        }
+
+        // Wake word not found, continue listening
+        console.log('🔄 Wake word not detected, listening again...\n');
       }
-
-      return false;
     } catch (error) {
       console.error('❌ Error listening for wake word:', error);
       return false;
@@ -66,94 +74,44 @@ class VoiceAssistant {
 
   async processVoiceInput(): Promise<void> {
     try {
-      // Step 1: Listen for wake word
-      const wakeWordDetected = await this.listenForWakeWord();
-
-      if (!wakeWordDetected) {
-        console.log('⚠️  Wake word not detected. Listening again...\n');
-        return;
-      }
+      // Step 1: Listen for wake word (will loop internally until detected)
+      await this.listenForWakeWord();
 
       // Step 2: Acknowledge wake word
       console.log('\n✅ Wake word detected!\n');
       await this.textToSpeech.speak('Yes');
 
-      // Step 3: Record user command in chunks, checking for "full stop" after each chunk
+      // Brief pause to let TTS complete and microphone settle
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      // Step 3: Record user command with automatic stop after 1.5 seconds of silence
       console.log('\n🎙️  Listening for your command...\n');
-      console.log('💡 Speak your question, then say "full stop" to finish\n');
+      console.log(
+        '💡 Speak your question (will auto-stop after 1.5 seconds of silence below volume 200)\n'
+      );
 
-      let fullTranscription = '';
-      let shouldContinue = true;
-      const maxIterations = 12; // 12 x 5 seconds = 60 seconds max
-      let iteration = 0;
+      // Record with custom volume-based silence detection
+      const audioStream = this.audioInput.startRecording(0, 1.5, 400);
 
-      while (shouldContinue && iteration < maxIterations) {
-        iteration++;
+      // Fallback timeout in case silence detection fails
+      const transcriptionPromise = this.speechToText.recognizeStream(audioStream);
+      const maxRecordingTimeout = setTimeout(() => {
+        console.log('⏱️  Max recording time reached (30s), stopping...');
+        this.audioInput.stopRecording();
+      }, 30000); // 30 second fallback timeout
 
-        // Record 5-second chunks
-        const audioStream = this.audioInput.startRecording(0, 0);
-        const transcriptionPromise = this.speechToText.recognizeStream(audioStream);
-
-        // Stop after 5 seconds
-        const chunkTimeout = setTimeout(() => {
-          this.audioInput.stopRecording();
-        }, 5000);
-
-        const chunkText = await transcriptionPromise;
-        clearTimeout(chunkTimeout);
-
-        console.log(`📝 Chunk ${iteration}: "${chunkText}"`);
-
-        // Check if this chunk contains "full stop"
-        const normalizedChunk = chunkText.toLowerCase().trim();
-        if (normalizedChunk.includes('full stop') ||
-            normalizedChunk.includes('fullstop') ||
-            normalizedChunk.includes('full-stop')) {
-          console.log('🛑 Detected "full stop" - ending recording');
-          fullTranscription += ' ' + chunkText;
-          shouldContinue = false;
-        } else if (chunkText.trim().length > 0) {
-          fullTranscription += ' ' + chunkText;
-          console.log('💡 Continue speaking or say "full stop"...');
-          // Brief pause before next chunk
-          await new Promise(resolve => setTimeout(resolve, 500));
-        } else {
-          // Empty chunk - user might be done
-          console.log('⚠️  Silence detected. Say something or "full stop" to finish...');
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        }
-      }
-
-      const userText = fullTranscription.trim();
+      const userText = await transcriptionPromise;
+      clearTimeout(maxRecordingTimeout);
 
       console.log(`📋 Transcription result: "${userText}"`);
 
       if (!userText || userText.trim().length === 0) {
         console.log('⚠️  No speech detected. Please try again.\n');
-        await this.textToSpeech.speak('I didn\'t hear anything');
+        await this.textToSpeech.speak("I didn't hear anything");
         return;
       }
 
-      // Remove "full stop" or "period" from the end of the transcription
-      let cleanedText = userText.trim();
-      const endPhrases = ['full stop', 'fullstop', 'period', 'full-stop'];
-
-      for (const phrase of endPhrases) {
-        // Case insensitive removal of end phrase
-        const regex = new RegExp(`\\s*${phrase}\\.?\\s*$`, 'i');
-        cleanedText = cleanedText.replace(regex, '');
-      }
-
-      // Also remove trailing periods that might have been transcribed
-      cleanedText = cleanedText.replace(/\.\s*$/, '');
-
-      if (!cleanedText || cleanedText.trim().length === 0) {
-        console.log('⚠️  No content after removing end phrase. Please try again.\n');
-        await this.textToSpeech.speak('I didn\'t hear anything');
-        return;
-      }
-
-      console.log(`\n💬 You said: "${cleanedText}"\n`);
+      console.log(`\n💬 You said: "${userText}"\n`);
 
       // Step 4: Get ChatGPT response (or use test mode)
       let assistantResponse: string;
@@ -198,11 +156,13 @@ class VoiceAssistant {
           console.log(`📋 User response: "${userResponse}"`);
 
           // Check for affirmative response
-          if (normalized.includes('yes') ||
-              normalized.includes('yeah') ||
-              normalized.includes('continue') ||
-              normalized.includes('go ahead') ||
-              normalized.includes('keep going')) {
+          if (
+            normalized.includes('yes') ||
+            normalized.includes('yeah') ||
+            normalized.includes('continue') ||
+            normalized.includes('go ahead') ||
+            normalized.includes('keep going')
+          ) {
             shouldContinueSpeaking = true;
           } else {
             // Any other response (including "no", silence, or unclear) stops
@@ -222,40 +182,98 @@ class VoiceAssistant {
     }
   }
 
-  async calibrateNoiseFloor(): Promise<number> {
-    console.log('\n🔧 Calibrating noise floor...');
-    console.log('💡 Please be quiet for 3 seconds...\n');
+  async calibrateNoiseFloor(): Promise<{ threshold: number; silenceDuration: number }> {
+    console.log('\n🔧 Calibrating audio levels...\n');
 
-    const audioStream = this.audioInput.startRecording(0, 0);
+    // Step 1: Measure background noise
+    console.log('📊 Step 1: Measuring background noise');
+    console.log('💡 Please be completely quiet for 3 seconds...\n');
 
+    const silenceStream = this.audioInput.startRecording(0, 0);
     let maxNoise = 0;
-    let sampleCount = 0;
 
-    return new Promise((resolve) => {
-      audioStream.on('data', (chunk: Buffer) => {
+    await new Promise<void>((resolve) => {
+      silenceStream.on('data', (chunk: Buffer) => {
         for (let i = 0; i < chunk.length; i += 2) {
           const sample = Math.abs(chunk.readInt16LE(i));
           if (sample > maxNoise) {
             maxNoise = sample;
           }
-          sampleCount++;
         }
       });
 
       setTimeout(() => {
         this.audioInput.stopRecording();
-
-        // Suggested threshold is 2x the noise floor
-        const suggestedThreshold = maxNoise * 2;
-
-        console.log(`\n📊 Calibration complete:`);
-        console.log(`   Noise floor: ${maxNoise}`);
-        console.log(`   Suggested threshold: ${suggestedThreshold}`);
-        console.log(`   Samples analyzed: ${sampleCount}\n`);
-
-        resolve(suggestedThreshold);
+        console.log(`✅ Background noise level: ${maxNoise}\n`);
+        resolve();
       }, 3000);
     });
+
+    // Brief pause
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+
+    // Step 2: Measure speaking volume
+    console.log('📊 Step 2: Measuring your speaking volume');
+    console.log('💡 Please speak normally for 3 seconds (say anything)...\n');
+
+    const speakStream = this.audioInput.startRecording(0, 0);
+    let maxSpeech = 0;
+
+    await new Promise<void>((resolve) => {
+      speakStream.on('data', (chunk: Buffer) => {
+        for (let i = 0; i < chunk.length; i += 2) {
+          const sample = Math.abs(chunk.readInt16LE(i));
+          if (sample > maxSpeech) {
+            maxSpeech = sample;
+          }
+        }
+      });
+
+      setTimeout(() => {
+        this.audioInput.stopRecording();
+        console.log(`✅ Speaking volume: ${maxSpeech}\n`);
+        resolve();
+      }, 3000);
+    });
+
+    // Calculate optimal threshold
+    // Threshold should be between noise and speech, closer to noise
+    const range = maxSpeech - maxNoise;
+    const optimalThreshold = maxNoise + range * 0.3; // 30% above noise floor
+
+    // Convert to sox threshold format (0.0 to 1.0 scale)
+    // sox threshold is percentage of max possible amplitude (32767)
+    let soxThreshold = optimalThreshold / 32767;
+
+    // Cap threshold at reasonable maximum (50% = 0.5)
+    // If threshold is too high, silence detection won't work
+    if (soxThreshold > 0.5) {
+      console.log(
+        `⚠️  Calculated threshold too high (${(soxThreshold * 100).toFixed(1)}%), capping at 50%`
+      );
+      soxThreshold = 0.5;
+    }
+
+    // Ensure minimum threshold of 1% to avoid false triggers
+    if (soxThreshold < 0.01) {
+      console.log(
+        `⚠️  Calculated threshold too low (${(soxThreshold * 100).toFixed(1)}%), setting to 1%`
+      );
+      soxThreshold = 0.01;
+    }
+
+    console.log(`\n📊 Calibration Results:`);
+    console.log(`   Background noise: ${maxNoise}`);
+    console.log(`   Speaking volume: ${maxSpeech}`);
+    console.log(
+      `   Optimal threshold: ${optimalThreshold.toFixed(0)} (${(soxThreshold * 100).toFixed(1)}%)`
+    );
+    console.log(`   Recommended silence duration: 1.5s\n`);
+
+    return {
+      threshold: parseFloat(soxThreshold.toFixed(2)),
+      silenceDuration: 1.5,
+    };
   }
 
   async start(): Promise<void> {
@@ -266,19 +284,19 @@ class VoiceAssistant {
     // Initialize Whisper model
     await this.speechToText.initialize();
 
-    // Optional: Calibrate noise floor
-    if (process.env.CALIBRATE_NOISE === 'true') {
-      await this.calibrateNoiseFloor();
-    }
+    // Calibrate audio levels
+    const calibrationResult = await this.calibrateNoiseFloor();
+    this.calibratedThreshold = calibrationResult.threshold;
+    this.calibratedSilenceDuration = calibrationResult.silenceDuration;
 
-    console.log('💡 Say "hey you" to activate the assistant\n');
+    console.log('💡 Say "Isis" to activate the assistant\n');
 
     // Run continuously in a loop
     while (true) {
       await this.processVoiceInput();
 
       // Brief pause between interactions
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await new Promise((resolve) => setTimeout(resolve, 1000));
     }
   }
 }
