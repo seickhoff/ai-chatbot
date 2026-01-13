@@ -5,7 +5,9 @@ A voice-activated AI chatbot that listens to your voice, converts it to text, pr
 ## Architecture Flow
 
 ```
-Voice Input (Microphone)
+Voice Input (Microphone) → Continuous Recording Stream
+   ↓
+Wake Word Detection ("Isis") → Volume-based Silence Detection
    ↓
 Speech-to-Text (Whisper - FREE & OFFLINE)
    ↓
@@ -14,7 +16,17 @@ ChatGPT (OpenAI)
 Text-to-Speech (say.js - FREE & OFFLINE)
    ↓
 Audio Output (Speaker)
+   ↓
+Return to Wake Word Listening (Continuous Loop)
 ```
+
+### Key Features
+
+- **Wake Word Activation**: Say "Isis" to activate the assistant
+- **Continuous Recording**: Sox/ALSA runs continuously - no stop/start delays
+- **Volume-based Silence Detection**: Automatically stops recording after 1.5s of silence
+- **Instant Response**: No 3-second delay between wake word cycles
+- **Configurable Threshold**: Adjust `VOLUME_THRESHOLD` in `.env` for your environment
 
 ## Tech Stack
 
@@ -141,8 +153,18 @@ Edit [.env](.env) and add your OpenAI API key:
 
 ```bash
 OPENAI_API_KEY=your_openai_api_key_here
-OPENAI_MODEL=gpt-4-turbo-preview
+OPENAI_MODEL=gpt-4o-mini
 WHISPER_MODEL_PATH=./models/ggml-base.en.bin
+
+# Volume threshold for silence detection (higher = less sensitive)
+# Adjust based on your microphone and environment
+VOLUME_THRESHOLD=900
+
+# Optional: Enable test mode to echo back without ChatGPT
+TEST_MODE=false
+
+# Optional: Calibrate noise floor on startup
+CALIBRATE_NOISE=false
 ```
 
 ## Usage
@@ -172,13 +194,15 @@ npm run format
 ai-chatbot/
 ├── src/
 │   ├── services/
-│   │   ├── AudioInputService.ts      # Microphone recording
-│   │   ├── WhisperSTTService.ts      # Whisper speech-to-text
-│   │   ├── ChatGPTService.ts         # OpenAI conversation
-│   │   ├── SayTTSService.ts          # say.js text-to-speech
-│   │   └── AudioOutputService.ts     # Speaker output
-│   └── index.ts                       # Main orchestrator
-├── models/                            # Whisper models directory
+│   │   ├── AudioInputService.ts           # Microphone recording (continuous mode)
+│   │   ├── ContinuousListenerService.ts   # Wake word & command detection
+│   │   ├── WhisperSTTService.ts           # Whisper speech-to-text
+│   │   ├── ChatGPTService.ts              # OpenAI conversation
+│   │   ├── SayTTSService.ts               # say.js text-to-speech
+│   │   └── AudioOutputService.ts          # Speaker output
+│   ├── index.ts                            # Main orchestrator
+│   └── transcribe.js                       # Whisper transcription worker
+├── models/                                 # Whisper models directory
 ├── package.json
 ├── tsconfig.json
 ├── .prettierrc
@@ -187,11 +211,35 @@ ai-chatbot/
 
 ## How It Works
 
-1. **AudioInputService** captures audio from your microphone (automatically uses SoX on macOS or ALSA on Raspberry Pi)
-2. **WhisperSTTService** converts the audio stream to text using Whisper.cpp (offline, free, GPU-accelerated on macOS)
-3. **ChatGPTService** processes the text and generates a response (maintains conversation history)
-4. **SayTTSService** converts the response text to audio using say.js (offline, free)
-5. **AudioOutputService** plays the audio response through your speakers
+### Continuous Recording Architecture
+
+1. **AudioInputService** starts continuous recording using Sox (macOS) or ALSA (Raspberry Pi)
+   - Single sox/arecord process runs throughout the entire session
+   - No stop/start delays between interactions
+
+2. **ContinuousListenerService** manages the audio stream in two modes:
+   - **Wake Word Mode**: Buffers audio chunks, detects silence, transcribes, checks for "Isis"
+   - **Command Mode**: Listens for user command after wake word detected
+   - Single data handler switches between modes seamlessly
+
+3. **Volume-based Silence Detection**:
+   - Monitors audio volume in real-time
+   - Triggers transcription after 1.5s of silence below threshold
+   - Threshold configurable via `VOLUME_THRESHOLD` in `.env` (default: 900)
+
+4. **WhisperSTTService** converts buffered audio to text:
+   - Uses Whisper.cpp (offline, free)
+   - GPU-accelerated on macOS (Metal)
+   - CPU-optimized on Raspberry Pi
+
+5. **ChatGPTService** processes the command and generates a response
+   - Maintains conversation history
+
+6. **SayTTSService** converts response to speech (offline, free)
+
+7. **AudioOutputService** plays the response through speakers
+
+8. Returns to wake word listening mode (continuous loop)
 
 ## Platform Support
 
@@ -208,14 +256,52 @@ Simply run the same code on either platform - all components are auto-detected!
 - **ChatGPT API:** Pay per use (only cost in the system)
 - **Total setup cost:** $0 + OpenAI API usage
 
-## Next Steps
+## Raspberry Pi Deployment
 
-- Add continuous listening loop
-- Implement wake word detection
-- Add support for multiple languages (Vosk supports 20+ languages)
-- Create web interface
+This code will work on Raspberry Pi 4 without modification! The architecture uses:
+
+- **ALSA** for audio recording (built into Raspberry Pi OS)
+- **Whisper.cpp** for speech-to-text (CPU-optimized)
+- **Festival** for text-to-speech (install with `apt-get`)
+- **Same continuous recording approach** - single arecord process runs throughout session
+
+### Platform Auto-Detection
+
+The code automatically detects your platform and uses the appropriate tools:
+
+| Component | macOS | Raspberry Pi |
+|-----------|-------|--------------|
+| Recording | Sox | ALSA (arecord) |
+| TTS | Built-in `say` | Festival |
+| STT | Whisper (Metal GPU) | Whisper (CPU) |
+| Continuous Mode | ✅ | ✅ |
+
+Simply run `npm start` on either platform - everything works the same way!
+
+## Future Enhancements
+
+- Add support for multiple wake words
+- Implement conversation context pruning
+- Add support for multiple languages
+- Create web interface for remote control
 
 ## Troubleshooting
+
+### Problem: Wake word not detected
+
+**Solution:** Adjust `VOLUME_THRESHOLD` in `.env`
+
+The volume threshold determines what counts as "silence" vs "speech". If the wake word isn't being detected:
+
+1. Watch the volume logs: `📊 Volume: 6945 (21.2%)`
+2. Your speaking volume should be **above** the threshold
+3. Background silence should be **below** the threshold
+4. Adjust `VOLUME_THRESHOLD` accordingly:
+   - **Too high** (e.g., 5000): Won't detect any speech
+   - **Too low** (e.g., 200): Triggers on background noise
+   - **Good range**: 400-900 for most environments
+
+You can also run calibration on startup by setting `CALIBRATE_NOISE=true` in `.env`
 
 ### Problem: npm install fails with compilation errors
 
