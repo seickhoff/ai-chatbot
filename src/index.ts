@@ -4,6 +4,8 @@ import { WhisperSTTService } from './services/WhisperSTTService';
 import { ChatGPTService } from './services/ChatGPTService';
 import { SayTTSService } from './services/SayTTSService';
 import { AudioOutputService } from './services/AudioOutputService';
+import { ContinuousListenerService } from './services/ContinuousListenerService';
+import { Readable } from 'stream';
 
 dotenv.config();
 
@@ -13,13 +15,18 @@ class VoiceAssistant {
   private chatGPT: ChatGPTService;
   private textToSpeech: SayTTSService;
   private audioOutput: AudioOutputService;
+  private continuousListener: ContinuousListenerService | null = null;
+  private continuousStream: Readable | null = null;
   private calibratedThreshold: number = 0.5;
   private calibratedSilenceDuration: number = 1.5;
+
+  private volumeThreshold: number;
 
   constructor() {
     const openaiKey = process.env.OPENAI_API_KEY;
     const openaiModel = process.env.OPENAI_MODEL || 'gpt-4-turbo-preview';
     const whisperModelPath = process.env.WHISPER_MODEL_PATH || './models/ggml-base.en.bin';
+    this.volumeThreshold = parseInt(process.env.VOLUME_THRESHOLD || '400', 10);
 
     if (!openaiKey) {
       throw new Error('OPENAI_API_KEY environment variable is required');
@@ -36,36 +43,21 @@ class VoiceAssistant {
     try {
       console.log('\n👂 Listening continuously for wake word "Isis"...\n');
 
-      // Keep listening in a loop until we hear the wake word
-      while (true) {
-        // Record with volume-based silence detection
-        // Stop after 1.5 seconds of silence below 400 (after user finishes speaking)
-        const audioStream = this.audioInput.startRecording(0, 1.5, 400);
-        const transcriptionPromise = this.speechToText.recognizeStream(audioStream);
-
-        // Fallback timeout after 30 seconds in case silence detection doesn't work
-        const timeout = new Promise<void>((resolve) => {
-          setTimeout(() => {
-            console.log('⏱️  30 second timeout reached, stopping recording...');
-            this.audioInput.stopRecording();
-            resolve();
-          }, 30000);
-        });
-
-        await Promise.race([transcriptionPromise, timeout]);
-        const userText = await transcriptionPromise;
-
-        console.log(`📋 Heard: "${userText}"`);
-
-        // Check if wake word was detected
-        const normalizedText = userText.toLowerCase().trim();
-        if (normalizedText.includes('isis') || normalizedText.includes('ice is')) {
-          return true;
-        }
-
-        // Wake word not found, continue listening
-        console.log('🔄 Wake word not detected, listening again...\n');
+      // Start continuous recording if not already started
+      if (!this.continuousStream || !this.continuousListener) {
+        this.continuousStream = this.audioInput.startContinuousRecording();
+        this.continuousListener = new ContinuousListenerService(
+          this.speechToText,
+          this.volumeThreshold,
+          1.5
+        );
+        // Start the continuous listener
+        this.continuousListener.startListening(this.continuousStream);
       }
+
+      // Listen for wake word
+      await this.continuousListener.listenForWakeWord();
+      return true;
     } catch (error) {
       console.error('❌ Error listening for wake word:', error);
       return false;
@@ -87,21 +79,16 @@ class VoiceAssistant {
       // Step 3: Record user command with automatic stop after 1.5 seconds of silence
       console.log('\n🎙️  Listening for your command...\n');
       console.log(
-        '💡 Speak your question (will auto-stop after 1.5 seconds of silence below volume 200)\n'
+        `💡 Speak your question (will auto-stop after 1.5 seconds of silence below volume ${this.volumeThreshold})\n`
       );
 
-      // Record with custom volume-based silence detection
-      const audioStream = this.audioInput.startRecording(0, 1.5, 400);
-
-      // Fallback timeout in case silence detection fails
-      const transcriptionPromise = this.speechToText.recognizeStream(audioStream);
-      const maxRecordingTimeout = setTimeout(() => {
-        console.log('⏱️  Max recording time reached (30s), stopping...');
-        this.audioInput.stopRecording();
-      }, 30000); // 30 second fallback timeout
-
-      const userText = await transcriptionPromise;
-      clearTimeout(maxRecordingTimeout);
+      // Use continuous stream to listen for command
+      let userText = '';
+      if (this.continuousListener) {
+        userText = await this.continuousListener.listenForCommand();
+      } else {
+        throw new Error('Continuous listener not initialized');
+      }
 
       console.log(`📋 Transcription result: "${userText}"`);
 
